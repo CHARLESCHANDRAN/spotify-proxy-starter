@@ -153,7 +153,7 @@ app.get("/api/spotify/available-genre-seeds", async (req, res) => {
 });
 
 // -------------------------------------------------------
-// Recommendations (verbose errors + sane defaults + 5-seed cap)
+// Recommendations (with graceful fallback for 404/403)
 // -------------------------------------------------------
 app.get("/api/spotify/recommendations", async (req, res) => {
 	try {
@@ -167,39 +167,36 @@ app.get("/api/spotify/recommendations", async (req, res) => {
 						.map((s) => s.trim())
 						.filter(Boolean);
 
-		const artistsArr = splitCSV(req.query.seed_artists);
-		const tracksArr = splitCSV(req.query.seed_tracks);
-		const genresArr = splitCSV(req.query.seed_genres);
+		let artistsArr = splitCSV(req.query.seed_artists);
+		let tracksArr = splitCSV(req.query.seed_tracks);
+		let genresArr = splitCSV(req.query.seed_genres);
 
-		// Fallback seeds if none provided (valid slugs)
+		// If no seeds provided, safe defaults
 		if (artistsArr.length + tracksArr.length + genresArr.length === 0) {
-			genresArr.push("pop", "rock", "hip-hop");
+			genresArr = ["pop", "rock", "hip-hop"]; // valid genre slugs
 		}
 
-		// Enforce ≤5 total seeds
+		// Enforce ≤5 seeds
 		let remaining = 5;
-		const a = artistsArr.slice(0, remaining);
-		remaining -= a.length;
-		const t = tracksArr.slice(0, remaining);
-		remaining -= t.length;
-		const g = genresArr.slice(0, remaining);
+		artistsArr = artistsArr.slice(0, remaining);
+		remaining -= artistsArr.length;
+		tracksArr = tracksArr.slice(0, remaining);
+		remaining -= tracksArr.length;
+		genresArr = genresArr.slice(0, remaining);
 
+		// Build params for the official endpoint
 		const params = new URLSearchParams();
-		if (a.length) params.set("seed_artists", a.join(","));
-		if (t.length) params.set("seed_tracks", t.join(","));
-		if (g.length) params.set("seed_genres", g.join(","));
+		if (artistsArr.length) params.set("seed_artists", artistsArr.join(","));
+		if (tracksArr.length) params.set("seed_tracks", tracksArr.join(","));
+		if (genresArr.length) params.set("seed_genres", genresArr.join(","));
 
-		// limit (1–100)
 		const limit = Math.min(
 			Math.max(parseInt(req.query.limit || "20", 10) || 20, 1),
 			100
 		);
 		params.set("limit", String(limit));
-
-		// market default to US for sanity (can be overridden by query)
 		params.set("market", (req.query.market || "US").toString());
 
-		// pass through tunables if present
 		const tunables = [
 			"target_acousticness",
 			"target_danceability",
@@ -233,37 +230,125 @@ app.get("/api/spotify/recommendations", async (req, res) => {
 		];
 		for (const p of tunables) {
 			const v = req.query[p];
-			if (v !== undefined && v !== null && String(v).trim() !== "") {
+			if (v !== undefined && v !== null && String(v).trim() !== "")
 				params.set(p, String(v));
-			}
 		}
 
-		const url = `${API}/recommendations?${params.toString()}`;
-		console.log("[reco] Upstream URL:", url);
-
-		const r = await fetch(url, {
+		const officialUrl = `${API}/recommendations?${params.toString()}`;
+		const r = await fetch(officialUrl, {
 			headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
 		});
 
-		if (!r.ok) {
-			// Decode JSON if possible; otherwise use raw text or note empty
-			let bodyText = await r.text();
-			let bodyJson = null;
-			try {
-				bodyJson = bodyText ? JSON.parse(bodyText) : null;
-			} catch {}
-			const errorPayload = bodyJson ?? (bodyText || "(empty body)");
-			console.error("[reco] Upstream error", r.status, errorPayload);
-			return res.status(r.status).json({
-				error: "Upstream Spotify error",
-				status: r.status,
-				upstream: errorPayload,
-				url,
-			});
+		// If official endpoint works, return it
+		if (r.ok) {
+			const data = await r.json();
+			return res.json(data);
 		}
 
-		const data = await r.json();
-		res.json(data);
+		// If 404/403 → graceful fallback for newer apps / restricted access
+		if (r.status === 404 || r.status === 403) {
+			console.warn(
+				"[reco] Falling back (status =",
+				r.status,
+				") url:",
+				officialUrl
+			);
+
+			// Fallback strategy:
+			// - If artist seeds: gather each artist's top tracks
+			// - Else if genre seeds: do track search per genre (genre:"...") and merge
+			// - Else try a generic popular search
+			const collected = [];
+			const seen = new Set();
+
+			const pushUnique = (track) => {
+				if (!track || !track.id || seen.has(track.id)) return;
+				seen.add(track.id);
+				collected.push(track);
+			};
+
+			// 1) Artist seeds → top tracks
+			for (const artistId of artistsArr) {
+				try {
+					const topUrl = `${API}/artists/${encodeURIComponent(
+						artistId
+					)}/top-tracks?market=${params.get("market")}`;
+					const tr = await fetch(topUrl, {
+						headers: { Authorization: `Bearer ${token}` },
+					});
+					if (tr.ok) {
+						const tj = await tr.json();
+						(tj.tracks || []).forEach(pushUnique);
+					}
+				} catch {}
+				if (collected.length >= limit) break;
+			}
+
+			// 2) Genre seeds → search tracks by genre
+			if (collected.length < limit && genresArr.length) {
+				for (const g of genresArr) {
+					try {
+						// Spotify Search supports genre filter in queries
+						const q = `genre:"${g}"`;
+						const searchUrl = `${API}/search?q=${encodeURIComponent(
+							q
+						)}&type=track&market=${params.get("market")}&limit=${Math.min(
+							50,
+							limit
+						)}`;
+						const sr = await fetch(searchUrl, {
+							headers: { Authorization: `Bearer ${token}` },
+						});
+						if (sr.ok) {
+							const sj = await sr.json();
+							(sj.tracks?.items || []).forEach(pushUnique);
+						}
+					} catch {}
+					if (collected.length >= limit) break;
+				}
+			}
+
+			// 3) Track seeds → include the seed tracks themselves (plus any found by artist/genre)
+			if (collected.length < limit && tracksArr.length) {
+				for (const tid of tracksArr) {
+					try {
+						const tUrl = `${API}/tracks/${encodeURIComponent(tid)}`;
+						const tr = await fetch(tUrl, {
+							headers: { Authorization: `Bearer ${token}` },
+						});
+						if (tr.ok) {
+							const tj = await tr.json();
+							pushUnique(tj);
+						}
+					} catch {}
+					if (collected.length >= limit) break;
+				}
+			}
+
+			// Trim to requested limit and return in the same shape as /recommendations
+			return res.json({ tracks: collected.slice(0, limit) });
+		}
+
+		// Other errors: bubble up details for debugging
+		let bodyText = await r.text();
+		let bodyJson = null;
+		try {
+			bodyJson = bodyText ? JSON.parse(bodyText) : null;
+		} catch {}
+		const errorPayload = bodyJson ?? (bodyText || "(empty body)");
+		console.error(
+			"[reco] Upstream error",
+			r.status,
+			errorPayload,
+			"url:",
+			officialUrl
+		);
+		return res.status(r.status).json({
+			error: "Upstream Spotify error",
+			status: r.status,
+			upstream: errorPayload,
+			url: officialUrl,
+		});
 	} catch (e) {
 		console.error("[reco] Handler error:", e);
 		res.status(500).json({ error: String(e) });
